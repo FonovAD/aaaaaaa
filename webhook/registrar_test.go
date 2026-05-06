@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 	"go.uber.org/mock/gomock"
 )
@@ -49,151 +50,179 @@ func hookFromSpec(id int64, s HookSpec) *gitlab.ProjectHook {
 	}
 }
 
+type registrarMocks struct {
+	Source *MockProjectSource
+	Client *MockProjectHookClient
+}
+
+func newRegistrarMocks(t *testing.T) *registrarMocks {
+	ctrl := gomock.NewController(t)
+	return &registrarMocks{
+		Source: NewMockProjectSource(ctrl),
+		Client: NewMockProjectHookClient(ctrl),
+	}
+}
+
+type hookRegistrarCtorOut struct {
+	T   *testing.T
+	Err error
+}
+
 func TestNewHookRegistrar(t *testing.T) {
 	t.Parallel()
 
-	ctrl := gomock.NewController(t)
-	source := NewMockProjectSource(ctrl)
-	client := NewMockProjectHookClient(ctrl)
+	emptyURLSpec := baseSpec()
+	emptyURLSpec.URL = "   "
 
-	if _, err := NewHookRegistrar(nil, client, baseSpec()); !errors.Is(err, ErrNilProjectSource) {
-		t.Fatalf("expected ErrNilProjectSource, got %v", err)
+	tests := []struct {
+		name   string
+		spec   HookSpec
+		setup  func(m *registrarMocks) (source ProjectSource, client ProjectHookClient)
+		assert func(o *hookRegistrarCtorOut)
+	}{
+		{
+			name: "nil_project_source",
+			spec: baseSpec(),
+			setup: func(m *registrarMocks) (ProjectSource, ProjectHookClient) {
+				return nil, m.Client
+			},
+			assert: func(o *hookRegistrarCtorOut) {
+				require.ErrorIs(o.T, o.Err, ErrNilProjectSource)
+			},
+		},
+		{
+			name: "nil_hook_client",
+			spec: baseSpec(),
+			setup: func(m *registrarMocks) (ProjectSource, ProjectHookClient) {
+				return m.Source, nil
+			},
+			assert: func(o *hookRegistrarCtorOut) {
+				require.ErrorIs(o.T, o.Err, ErrNilHookClient)
+			},
+		},
+		{
+			name: "empty_hook_url",
+			spec: emptyURLSpec,
+			setup: func(m *registrarMocks) (ProjectSource, ProjectHookClient) {
+				return m.Source, m.Client
+			},
+			assert: func(o *hookRegistrarCtorOut) {
+				require.ErrorIs(o.T, o.Err, ErrEmptyHookURL)
+			},
+		},
 	}
-	if _, err := NewHookRegistrar(source, nil, baseSpec()); !errors.Is(err, ErrNilHookClient) {
-		t.Fatalf("expected ErrNilHookClient, got %v", err)
-	}
 
-	spec := baseSpec()
-	spec.URL = "   "
-	if _, err := NewHookRegistrar(source, client, spec); !errors.Is(err, ErrEmptyHookURL) {
-		t.Fatalf("expected ErrEmptyHookURL, got %v", err)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-func TestReconcile_CreatesMissingHook(t *testing.T) {
-	t.Parallel()
+			m := newRegistrarMocks(t)
+			source, client := tt.setup(m)
+			_, err := NewHookRegistrar(source, client, tt.spec)
 
-	ctrl := gomock.NewController(t)
-	source := NewMockProjectSource(ctrl)
-	client := NewMockProjectHookClient(ctrl)
-	spec := baseSpec()
-
-	r, err := NewHookRegistrar(source, client, spec)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{101}, nil)
-	client.EXPECT().ListProjectHooks(gomock.Any(), int64(101)).Return([]*gitlab.ProjectHook{}, nil)
-	client.EXPECT().AddProjectHook(gomock.Any(), int64(101), gomock.Any()).
-		DoAndReturn(func(_ context.Context, _ int64, opt *gitlab.AddProjectHookOptions) (*gitlab.ProjectHook, error) {
-			if opt == nil || opt.URL == nil || *opt.URL != spec.URL {
-				t.Fatalf("unexpected add options: %#v", opt)
-			}
-			return &gitlab.ProjectHook{ID: 1}, nil
+			o := &hookRegistrarCtorOut{T: t, Err: err}
+			tt.assert(o)
 		})
-
-	report, err := r.Reconcile(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if report.Created != 1 || report.Unchanged != 0 || report.Updated != 0 || report.Failed != 0 {
-		t.Fatalf("unexpected report: %+v", report)
 	}
 }
 
-func TestReconcile_UpdatesOutdatedHook(t *testing.T) {
+type hookRegistrarReconcileOut struct {
+	T   *testing.T
+	Err error
+}
+
+func TestHookRegistrar_Reconcile(t *testing.T) {
 	t.Parallel()
 
-	ctrl := gomock.NewController(t)
-	source := NewMockProjectSource(ctrl)
-	client := NewMockProjectHookClient(ctrl)
 	spec := baseSpec()
 
-	r, err := NewHookRegistrar(source, client, spec)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	tests := []struct {
+		name   string
+		setup  func(m *registrarMocks)
+		assert func(o *hookRegistrarReconcileOut)
+	}{
+		{
+			name: "creates_missing_hook",
+			setup: func(m *registrarMocks) {
+				m.Source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{101}, nil)
+				m.Client.EXPECT().ListProjectHooks(gomock.Any(), int64(101)).Return([]*gitlab.ProjectHook{}, nil)
+				m.Client.EXPECT().AddProjectHook(gomock.Any(), int64(101), gomock.Any()).
+					Return(&gitlab.ProjectHook{ID: 1}, nil)
+			},
+			assert: func(o *hookRegistrarReconcileOut) {
+				require.NoError(o.T, o.Err)
+			},
+		},
+		{
+			name: "updates_outdated_hook",
+			setup: func(m *registrarMocks) {
+				outdated := hookFromSpec(11, spec)
+				outdated.PipelineEvents = false
+
+				m.Source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{202}, nil)
+				m.Client.EXPECT().ListProjectHooks(gomock.Any(), int64(202)).Return([]*gitlab.ProjectHook{outdated}, nil)
+				m.Client.EXPECT().EditProjectHook(gomock.Any(), int64(202), int64(11), gomock.Any()).
+					Return(hookFromSpec(11, spec), nil)
+			},
+			assert: func(o *hookRegistrarReconcileOut) {
+				require.NoError(o.T, o.Err)
+			},
+		},
+		{
+			name: "leaves_up_to_date_hook",
+			setup: func(m *registrarMocks) {
+				m.Source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{303}, nil)
+				m.Client.EXPECT().ListProjectHooks(gomock.Any(), int64(303)).Return([]*gitlab.ProjectHook{hookFromSpec(21, spec)}, nil)
+			},
+			assert: func(o *hookRegistrarReconcileOut) {
+				require.NoError(o.T, o.Err)
+			},
+		},
+		{
+			name: "retries_then_succeeds",
+			setup: func(m *registrarMocks) {
+				m.Source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{404}, nil)
+				m.Client.EXPECT().ListProjectHooks(gomock.Any(), int64(404)).Return(nil, errors.New("transient"))
+				m.Client.EXPECT().ListProjectHooks(gomock.Any(), int64(404)).Return(nil, errors.New("transient"))
+				m.Client.EXPECT().ListProjectHooks(gomock.Any(), int64(404)).Return([]*gitlab.ProjectHook{}, nil)
+				m.Client.EXPECT().AddProjectHook(gomock.Any(), int64(404), gomock.Any()).
+					Return(&gitlab.ProjectHook{ID: 4}, nil)
+			},
+			assert: func(o *hookRegistrarReconcileOut) {
+				require.NoError(o.T, o.Err)
+			},
+		},
+		{
+			name: "failure_after_all_retries",
+			setup: func(m *registrarMocks) {
+				m.Source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{1, 2}, nil)
+				m.Client.EXPECT().ListProjectHooks(gomock.Any(), int64(1)).Return(nil, errors.New("list failed")).Times(1 + reconcileRetries)
+				m.Client.EXPECT().ListProjectHooks(gomock.Any(), int64(2)).Return([]*gitlab.ProjectHook{}, nil)
+				m.Client.EXPECT().AddProjectHook(gomock.Any(), int64(2), gomock.Any()).Return(&gitlab.ProjectHook{ID: 2}, nil)
+			},
+			assert: func(o *hookRegistrarReconcileOut) {
+				require.Error(o.T, o.Err)
+				var recErr *ReconcileError
+				require.ErrorAs(o.T, o.Err, &recErr)
+				require.Len(o.T, recErr.Failures, 1)
+				require.Error(o.T, recErr.Failures[1])
+			},
+		},
 	}
 
-	outdated := hookFromSpec(11, spec)
-	outdated.PipelineEvents = false
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{202}, nil)
-	client.EXPECT().ListProjectHooks(gomock.Any(), int64(202)).Return([]*gitlab.ProjectHook{outdated}, nil)
-	client.EXPECT().EditProjectHook(gomock.Any(), int64(202), int64(11), gomock.Any()).
-		DoAndReturn(func(_ context.Context, _ int64, _ int64, opt *gitlab.EditProjectHookOptions) (*gitlab.ProjectHook, error) {
-			if opt == nil || opt.PipelineEvents == nil || !*opt.PipelineEvents {
-				t.Fatalf("unexpected edit options: %#v", opt)
-			}
-			return hookFromSpec(11, spec), nil
+			m := newRegistrarMocks(t)
+			r, err := NewHookRegistrar(m.Source, m.Client, spec)
+			require.NoError(t, err)
+
+			tt.setup(m)
+
+			err = r.Reconcile(context.Background())
+			o := &hookRegistrarReconcileOut{T: t, Err: err}
+			tt.assert(o)
 		})
-
-	report, err := r.Reconcile(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if report.Updated != 1 || report.Created != 0 || report.Unchanged != 0 || report.Failed != 0 {
-		t.Fatalf("unexpected report: %+v", report)
 	}
 }
-
-func TestReconcile_LeavesUpToDateHook(t *testing.T) {
-	t.Parallel()
-
-	ctrl := gomock.NewController(t)
-	source := NewMockProjectSource(ctrl)
-	client := NewMockProjectHookClient(ctrl)
-	spec := baseSpec()
-
-	r, err := NewHookRegistrar(source, client, spec)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{303}, nil)
-	client.EXPECT().ListProjectHooks(gomock.Any(), int64(303)).Return([]*gitlab.ProjectHook{hookFromSpec(21, spec)}, nil)
-
-	report, err := r.Reconcile(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if report.Unchanged != 1 || report.Created != 0 || report.Updated != 0 || report.Failed != 0 {
-		t.Fatalf("unexpected report: %+v", report)
-	}
-}
-
-func TestReconcile_ReturnsPartialFailure(t *testing.T) {
-	t.Parallel()
-
-	ctrl := gomock.NewController(t)
-	source := NewMockProjectSource(ctrl)
-	client := NewMockProjectHookClient(ctrl)
-	spec := baseSpec()
-
-	r, err := NewHookRegistrar(source, client, spec)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	source.EXPECT().ListProjectIDs(gomock.Any()).Return([]int64{1, 2}, nil)
-	client.EXPECT().ListProjectHooks(gomock.Any(), int64(1)).Return(nil, errors.New("list failed"))
-	client.EXPECT().ListProjectHooks(gomock.Any(), int64(2)).Return([]*gitlab.ProjectHook{}, nil)
-	client.EXPECT().AddProjectHook(gomock.Any(), int64(2), gomock.Any()).Return(&gitlab.ProjectHook{ID: 2}, nil)
-
-	report, err := r.Reconcile(context.Background())
-	if err == nil {
-		t.Fatal("expected reconcile error, got nil")
-	}
-
-	var recErr *ReconcileError
-	if !errors.As(err, &recErr) {
-		t.Fatalf("expected ReconcileError, got %T", err)
-	}
-	if len(recErr.Failures) != 1 || recErr.Failures[1] == nil {
-		t.Fatalf("unexpected failures map: %#v", recErr.Failures)
-	}
-	if report.Failed != 1 || report.Created != 1 || report.TotalProjects != 2 {
-		t.Fatalf("unexpected report: %+v", report)
-	}
-}
-

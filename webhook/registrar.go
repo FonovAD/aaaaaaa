@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
+
+const reconcileRetries = 3
 
 var (
 	ErrNilProjectSource = errors.New("project source is nil")
@@ -43,14 +46,6 @@ type HookSpec struct {
 	ReleasesEvents         bool
 }
 
-type ReconcileReport struct {
-	TotalProjects int
-	Created       int
-	Updated       int
-	Unchanged     int
-	Failed        int
-}
-
 type ReconcileError struct {
 	Failures map[int64]error
 }
@@ -83,30 +78,51 @@ func NewHookRegistrar(source ProjectSource, client ProjectHookClient, spec HookS
 	}, nil
 }
 
-func (r *HookRegistrar) Reconcile(ctx context.Context) (ReconcileReport, error) {
+// Reconcile приводит webhooks проектов к spec. При ошибке по проекту выполняется до reconcileRetries повторных
+// попыток с короткой задержкой между ними; после исчерпания попыток проект попадает в ReconcileError.
+func (r *HookRegistrar) Reconcile(ctx context.Context) error {
 	projectIDs, err := r.source.ListProjectIDs(ctx)
 	if err != nil {
-		return ReconcileReport{}, err
+		return err
 	}
 
-	report := ReconcileReport{TotalProjects: len(projectIDs)}
 	failures := make(map[int64]error)
 
 	for _, projectID := range projectIDs {
-		if err := r.reconcileProject(ctx, projectID, &report); err != nil {
-			report.Failed++
-			failures[projectID] = err
+		lastErr := r.reconcileProjectWithRetries(ctx, projectID)
+		if lastErr != nil {
+			failures[projectID] = lastErr
 		}
 	}
 
 	if len(failures) > 0 {
-		return report, &ReconcileError{Failures: failures}
+		return &ReconcileError{Failures: failures}
 	}
 
-	return report, nil
+	return nil
 }
 
-func (r *HookRegistrar) reconcileProject(ctx context.Context, projectID int64, report *ReconcileReport) error {
+func (r *HookRegistrar) reconcileProjectWithRetries(ctx context.Context, projectID int64) error {
+	var lastErr error
+	for attempt := 0; attempt <= reconcileRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(attempt) * 50 * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		lastErr = r.reconcileProject(ctx, projectID)
+		if lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
+func (r *HookRegistrar) reconcileProject(ctx context.Context, projectID int64) error {
 	hooks, err := r.client.ListProjectHooks(ctx, projectID)
 	if err != nil {
 		return err
@@ -118,21 +134,15 @@ func (r *HookRegistrar) reconcileProject(ctx context.Context, projectID int64, r
 		if err != nil {
 			return err
 		}
-		report.Created++
 		return nil
 	}
 
 	if r.matchesSpec(existing) {
-		report.Unchanged++
 		return nil
 	}
 
 	_, err = r.client.EditProjectHook(ctx, projectID, existing.ID, r.newEditOptions())
-	if err != nil {
-		return err
-	}
-	report.Updated++
-	return nil
+	return err
 }
 
 func (r *HookRegistrar) findManagedHook(hooks []*gitlab.ProjectHook) *gitlab.ProjectHook {
@@ -207,4 +217,3 @@ func (r *HookRegistrar) newEditOptions() *gitlab.EditProjectHookOptions {
 		ReleasesEvents:         gitlab.Ptr(r.spec.ReleasesEvents),
 	}
 }
-

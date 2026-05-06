@@ -12,237 +12,304 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
+type newHandlerOut struct {
+	T       *testing.T
+	Handler *Handler
+	Err     error
+	WantErr error
+}
+
 func TestNewHandler(t *testing.T) {
 	t.Parallel()
 
-	_, err := NewHandler(nil)
-	if !errors.Is(err, ErrNilParser) {
-		t.Fatalf("expected ErrNilParser, got %v", err)
+	tests := []struct {
+		name     string
+		parserFn func(*testing.T) Parser
+		wantErr  error
+		assert   func(o *newHandlerOut)
+	}{
+		{
+			name:     "nil_parser",
+			parserFn: func(*testing.T) Parser { return nil },
+			wantErr:  ErrNilParser,
+			assert: func(o *newHandlerOut) {
+				if !errors.Is(o.Err, o.WantErr) {
+					o.T.Fatalf("want error %v, got %v", o.WantErr, o.Err)
+				}
+			},
+		},
+		{
+			name: "ok",
+			parserFn: func(t *testing.T) Parser {
+				return NewMockParser(gomock.NewController(t))
+			},
+			wantErr: nil,
+			assert: func(o *newHandlerOut) {
+				if !errors.Is(o.Err, o.WantErr) {
+					o.T.Fatalf("want error %v, got %v", o.WantErr, o.Err)
+				}
+				if o.Handler == nil {
+					o.T.Fatal("expected non-nil Handler")
+				}
+			},
+		},
 	}
 
-	ctrl := gomock.NewController(t)
-	parser := NewMockParser(ctrl)
-	got, err := NewHandler(parser)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := NewHandler(tt.parserFn(t))
+			o := &newHandlerOut{T: t, Handler: got, Err: err, WantErr: tt.wantErr}
+			tt.assert(o)
+		})
 	}
-	if got == nil {
-		t.Fatal("expected handler, got nil")
-	}
+}
+
+type eventHandlerFuncOut struct {
+	T      *testing.T
+	Err    error
+	Called bool
 }
 
 func TestEventHandlerFunc_Handle(t *testing.T) {
 	t.Parallel()
 
-	called := false
-	f := EventHandlerFunc(func(_ context.Context, event any) error {
-		called = true
-		if event != "payload" {
-			t.Fatalf("unexpected event: %v", event)
-		}
-		return nil
-	})
-
-	if err := f.Handle(context.Background(), "payload"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	tests := []struct {
+		name   string
+		event  any
+		assert func(o *eventHandlerFuncOut)
+	}{
+		{
+			name:  "forwards_payload",
+			event: "payload",
+			assert: func(o *eventHandlerFuncOut) {
+				if o.Err != nil {
+					o.T.Fatalf("unexpected error: %v", o.Err)
+				}
+				if !o.Called {
+					o.T.Fatal("expected handler to run")
+				}
+			},
+		},
+		{
+			name:  "wrong_event_returns_error_via_func_body",
+			event: "other",
+			assert: func(o *eventHandlerFuncOut) {
+				if o.Err == nil {
+					o.T.Fatal("expected error, got nil")
+				}
+			},
+		},
 	}
-	if !called {
-		t.Fatal("expected handler function to be called")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var called bool
+			f := EventHandlerFunc(func(_ context.Context, event any) error {
+				called = true
+				if event != "payload" {
+					return errors.New("bad event")
+				}
+				return nil
+			})
+
+			err := f.Handle(context.Background(), tt.event)
+
+			o := &eventHandlerFuncOut{T: t, Err: err, Called: called}
+			tt.assert(o)
+		})
 	}
 }
 
-func TestRegisterAndServeHTTP_DispatchesByEventType(t *testing.T) {
+type handlerRegisterNilOut struct {
+	T   *testing.T
+	Err error
+}
+
+func TestHandler_Register_rejects_nil(t *testing.T) {
 	t.Parallel()
 
-	ctrl := gomock.NewController(t)
-	const eventType = gitlab.EventTypePush
-	event := &gitlab.PushEvent{Ref: "refs/heads/main"}
-	payload := `{"dummy":"payload"}`
-
-	parser := NewMockParser(ctrl)
-	h, err := NewHandler(parser)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	tests := []struct {
+		name   string
+		call   func(*Handler, gitlab.EventType) error
+		assert func(o *handlerRegisterNilOut)
+	}{
+		{
+			name: "Register",
+			call: func(h *Handler, et gitlab.EventType) error { return h.Register(et, nil) },
+			assert: func(o *handlerRegisterNilOut) {
+				if !errors.Is(o.Err, ErrNilHandler) {
+					o.T.Fatalf("want ErrNilHandler, got %v", o.Err)
+				}
+			},
+		},
+		{
+			name: "RegisterFunc",
+			call: func(h *Handler, et gitlab.EventType) error { return h.RegisterFunc(et, nil) },
+			assert: func(o *handlerRegisterNilOut) {
+				if !errors.Is(o.Err, ErrNilHandler) {
+					o.T.Fatalf("want ErrNilHandler, got %v", o.Err)
+				}
+			},
+		},
 	}
 
-	handlerA := NewMockEventHandler(ctrl)
-	handlerB := NewMockEventHandler(ctrl)
-	otherEventHandler := NewMockEventHandler(ctrl)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	if err := h.Register(eventType, handlerA); err != nil {
-		t.Fatalf("unexpected register error: %v", err)
-	}
-	if err := h.Register(eventType, handlerB); err != nil {
-		t.Fatalf("unexpected register error: %v", err)
-	}
+			ctrl := gomock.NewController(t)
+			h, err := NewHandler(NewMockParser(ctrl))
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
 
-	if err := h.Register(gitlab.EventTypeMergeRequest, otherEventHandler); err != nil {
-		t.Fatalf("unexpected register error: %v", err)
-	}
-
-	parser.EXPECT().EventType(gomock.Any()).Return(eventType)
-	parser.EXPECT().Parse(eventType, []byte(payload)).Return(event, nil)
-	handlerA.EXPECT().Handle(gomock.Any(), event).Return(nil)
-	handlerB.EXPECT().Handle(gomock.Any(), event).Return(nil)
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))
-	rec := httptest.NewRecorder()
-
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("expected %d, got %d", http.StatusNoContent, rec.Code)
+			err = tt.call(h, gitlab.EventTypePush)
+			o := &handlerRegisterNilOut{T: t, Err: err}
+			tt.assert(o)
+		})
 	}
 }
 
-func TestRegister_RejectsNilHandler(t *testing.T) {
+type handlerServeHTTPOut struct {
+	T        *testing.T
+	Recorder *httptest.ResponseRecorder
+	WantCode int
+}
+
+func assertHandlerServeHTTPStatus(o *handlerServeHTTPOut) {
+	if o.Recorder.Code != o.WantCode {
+		o.T.Fatalf("status: want %d, got %d", o.WantCode, o.Recorder.Code)
+	}
+}
+
+func TestHandler_ServeHTTP(t *testing.T) {
 	t.Parallel()
 
-	ctrl := gomock.NewController(t)
-	h, err := NewHandler(NewMockParser(ctrl))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	const pushPayload = `{"dummy":"payload"}`
+	pushEvent := &gitlab.PushEvent{Ref: "refs/heads/main"}
+
+	tests := []struct {
+		name   string
+		body   string
+		setup  func(t *testing.T, ctrl *gomock.Controller, payload string, h *Handler)
+		want   int
+		assert func(o *handlerServeHTTPOut)
+	}{
+		{
+			name: "dispatches_registered_handlers_same_event_type",
+			body: pushPayload,
+			setup: func(t *testing.T, ctrl *gomock.Controller, payload string, h *Handler) {
+				handlerA := NewMockEventHandler(ctrl)
+				handlerB := NewMockEventHandler(ctrl)
+				otherHandler := NewMockEventHandler(ctrl)
+				if err := h.Register(gitlab.EventTypePush, handlerA); err != nil {
+					t.Fatalf("Register: %v", err)
+				}
+				if err := h.Register(gitlab.EventTypePush, handlerB); err != nil {
+					t.Fatalf("Register: %v", err)
+				}
+				if err := h.Register(gitlab.EventTypeMergeRequest, otherHandler); err != nil {
+					t.Fatalf("Register: %v", err)
+				}
+
+				parser := h.parser.(*MockParser)
+				parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
+				parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(pushEvent, nil)
+				handlerA.EXPECT().Handle(gomock.Any(), pushEvent).Return(nil)
+				handlerB.EXPECT().Handle(gomock.Any(), pushEvent).Return(nil)
+			},
+			want:   http.StatusNoContent,
+			assert: assertHandlerServeHTTPStatus,
+		},
+		{
+			name: "register_func_delegate",
+			body: `{"x":1}`,
+			setup: func(t *testing.T, ctrl *gomock.Controller, payload string, h *Handler) {
+				handlerMock := NewMockEventHandler(ctrl)
+				if err := h.RegisterFunc(gitlab.EventTypePush, handlerMock.Handle); err != nil {
+					t.Fatalf("RegisterFunc: %v", err)
+				}
+				ev := &gitlab.PushEvent{Ref: "refs/heads/main"}
+				parser := h.parser.(*MockParser)
+				parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
+				parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(ev, nil)
+				handlerMock.EXPECT().Handle(gomock.Any(), ev).Return(nil)
+			},
+			want:   http.StatusNoContent,
+			assert: assertHandlerServeHTTPStatus,
+		},
+		{
+			name: "parse_error_bad_request",
+			body: `{"x":1}`,
+			setup: func(t *testing.T, ctrl *gomock.Controller, payload string, h *Handler) {
+				parser := h.parser.(*MockParser)
+				parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
+				parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(nil, errors.New("boom"))
+			},
+			want:   http.StatusBadRequest,
+			assert: assertHandlerServeHTTPStatus,
+		},
+		{
+			name: "handler_error_internal_server_error",
+			body: `{"x":1}`,
+			setup: func(t *testing.T, ctrl *gomock.Controller, payload string, h *Handler) {
+				handlerMock := NewMockEventHandler(ctrl)
+				if err := h.Register(gitlab.EventTypePush, handlerMock); err != nil {
+					t.Fatalf("Register: %v", err)
+				}
+				ev := &gitlab.PushEvent{Ref: "refs/heads/main"}
+				parser := h.parser.(*MockParser)
+				parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
+				parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(ev, nil)
+				handlerMock.EXPECT().Handle(gomock.Any(), ev).Return(errors.New("failed"))
+			},
+			want:   http.StatusInternalServerError,
+			assert: assertHandlerServeHTTPStatus,
+		},
+		{
+			name:   "empty_payload_bad_request",
+			body:   "",
+			setup:  func(t *testing.T, ctrl *gomock.Controller, payload string, h *Handler) {},
+			want:   http.StatusBadRequest,
+			assert: assertHandlerServeHTTPStatus,
+		},
+		{
+			name: "no_handlers_still_no_content",
+			body: `{"x":1}`,
+			setup: func(t *testing.T, ctrl *gomock.Controller, payload string, h *Handler) {
+				ev := &gitlab.PushEvent{Ref: "refs/heads/main"}
+				parser := h.parser.(*MockParser)
+				parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
+				parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(ev, nil)
+			},
+			want:   http.StatusNoContent,
+			assert: assertHandlerServeHTTPStatus,
+		},
 	}
 
-	if err := h.Register(gitlab.EventTypePush, nil); !errors.Is(err, ErrNilHandler) {
-		t.Fatalf("expected ErrNilHandler, got %v", err)
-	}
-	if err := h.RegisterFunc(gitlab.EventTypePush, nil); !errors.Is(err, ErrNilHandler) {
-		t.Fatalf("expected ErrNilHandler, got %v", err)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-func TestRegisterFunc_Success(t *testing.T) {
-	t.Parallel()
+			ctrl := gomock.NewController(t)
+			parser := NewMockParser(ctrl)
+			h, err := NewHandler(parser)
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
 
-	ctrl := gomock.NewController(t)
-	parser := NewMockParser(ctrl)
-	handlerMock := NewMockEventHandler(ctrl)
+			tt.setup(t, ctrl, tt.body, h)
 
-	h, err := NewHandler(parser)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(tt.body))
+			h.ServeHTTP(rec, req)
 
-	if err := h.RegisterFunc(gitlab.EventTypePush, handlerMock.Handle); err != nil {
-		t.Fatalf("unexpected register error: %v", err)
-	}
-
-	payload := `{"x":1}`
-	event := &gitlab.PushEvent{Ref: "refs/heads/main"}
-	parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
-	parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(event, nil)
-	handlerMock.EXPECT().Handle(gomock.Any(), event).Return(nil)
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("expected %d, got %d", http.StatusNoContent, rec.Code)
-	}
-}
-
-func TestServeHTTP_ParseError(t *testing.T) {
-	t.Parallel()
-
-	ctrl := gomock.NewController(t)
-	parser := NewMockParser(ctrl)
-	h, err := NewHandler(parser)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	payload := `{"x":1}`
-	parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
-	parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(nil, errors.New("boom"))
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))
-	rec := httptest.NewRecorder()
-
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected %d, got %d", http.StatusBadRequest, rec.Code)
-	}
-}
-
-func TestServeHTTP_HandlerError(t *testing.T) {
-	t.Parallel()
-
-	ctrl := gomock.NewController(t)
-	parser := NewMockParser(ctrl)
-	h, err := NewHandler(parser)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	handler := NewMockEventHandler(ctrl)
-	if err := h.Register(gitlab.EventTypePush, handler); err != nil {
-		t.Fatalf("unexpected register error: %v", err)
-	}
-
-	event := &gitlab.PushEvent{Ref: "refs/heads/main"}
-	payload := `{"x":1}`
-	parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
-	parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(event, nil)
-	handler.EXPECT().Handle(gomock.Any(), event).Return(errors.New("failed"))
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))
-	rec := httptest.NewRecorder()
-
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected %d, got %d", http.StatusInternalServerError, rec.Code)
-	}
-}
-
-func TestServeHTTP_EmptyPayload(t *testing.T) {
-	t.Parallel()
-
-	ctrl := gomock.NewController(t)
-	parser := NewMockParser(ctrl)
-
-	h, err := NewHandler(parser)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(""))
-	rec := httptest.NewRecorder()
-
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected %d, got %d", http.StatusBadRequest, rec.Code)
-	}
-}
-
-func TestServeHTTP_NoRegisteredHandlers(t *testing.T) {
-	t.Parallel()
-
-	ctrl := gomock.NewController(t)
-	parser := NewMockParser(ctrl)
-
-	h, err := NewHandler(parser)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	payload := `{"x":1}`
-	event := &gitlab.PushEvent{Ref: "refs/heads/main"}
-
-	parser.EXPECT().EventType(gomock.Any()).Return(gitlab.EventTypePush)
-	parser.EXPECT().Parse(gitlab.EventTypePush, []byte(payload)).Return(event, nil)
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))
-	rec := httptest.NewRecorder()
-
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("expected %d, got %d", http.StatusNoContent, rec.Code)
+			o := &handlerServeHTTPOut{T: t, Recorder: rec, WantCode: tt.want}
+			tt.assert(o)
+		})
 	}
 }
-
